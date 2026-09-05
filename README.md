@@ -1,6 +1,6 @@
 # Music Lyrics
 
-![](screenshots.png)
+![](Screenshot.png)
 
 A DankMaterialShell widget plugin that displays synced music lyrics from multiple sources right on your panel.
 
