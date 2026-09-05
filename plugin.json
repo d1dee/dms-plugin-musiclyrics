@@ -1,9 +1,9 @@
 {
   "id": "musicLyrics",
   "name": "Music Lyrics",
-  "description": "Display synced music lyrics from multiple sources",
+  "description": "Display synced music lyrics from multiple sources (forked from gasiyu)",
   "version": "1.5.0",
-  "author": "gasiyu",
+  "author": "d1dee",
   "icon": "lyrics",
   "type": "widget",
   "component": "./MusicLyrics.qml",
