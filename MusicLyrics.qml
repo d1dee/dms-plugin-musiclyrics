@@ -1,4 +1,6 @@
 import QtQuick
+import Qt5Compat.GraphicalEffects
+import QtQuick.Layouts
 import Quickshell
 import Quickshell.Services.Mpris
 import Quickshell.Io
@@ -23,8 +25,6 @@ PluginComponent {
     // Enum namespaces
     // -------------------------------------------------------------------------
 
-    // Chip-visible statuses for navidromeStatus, lrclibStatus, and cacheStatus.
-    // Values are globally unique so all three properties share one _chipMeta map.
     QtObject {
         id: status
         readonly property int none: 0
@@ -40,7 +40,6 @@ PluginComponent {
         readonly property int cacheDisabled: 13
     }
 
-    // Lyrics-fetch lifecycle.
     QtObject {
         id: lyricState
         readonly property int idle: 0
@@ -49,7 +48,6 @@ PluginComponent {
         readonly property int notFound: 3
     }
 
-    // Lyrics sources.
     QtObject {
         id: lyricSrc
         readonly property int none: 0
@@ -70,33 +68,28 @@ PluginComponent {
     property string _lastFetchedTrack: ""
     property string _lastFetchedArtist: ""
     property var _cancelActiveFetch: null
+    
+    property var _fallbackLines: []
+    property int _fallbackSource: lyricSrc.none
 
-    // Chip status properties
     property int navidromeStatus: status.none
     property int lrclibStatus: status.none
     property int lrcapiStatus: status.none
     property int musixmatchStatus: status.none
     property int cacheStatus: status.none
 
-    // Fetch state and source
     property int lyricStatus: lyricState.idle
     property int lyricSource: lyricSrc.none
 
-    // Track current song info
     property string currentTitle: activePlayer?.trackTitle ?? ""
     property string currentArtist: activePlayer?.trackArtist ?? ""
     property string currentAlbum: activePlayer?.trackAlbum ?? ""
     property real currentDuration: activePlayer?.length ?? 0
 
-    // Current lyric line for bar pill display
-
     property string currentLyricText: {
-        if (lyricsLoading)
-            return "Searching lyrics…";
-        if (lyricsLines.length > 0 && currentLineIndex >= 0)
-            return lyricsLines[currentLineIndex].text || "♪ ♪ ♪";
-        if (currentTitle)
-            return currentTitle;
+        if (lyricsLoading) return "Searching lyrics…";
+        if (lyricsLines.length > 0 && currentLineIndex >= 0) return lyricsLines[currentLineIndex].text || "♪ ♪ ♪";
+        if (currentTitle) return currentTitle;
         return "No lyrics";
     }
 
@@ -104,11 +97,9 @@ PluginComponent {
 
     on_ConfigValidChanged: {
         console.info("[MusicLyrics] Navidrome configured: " + (_configValid ? "yes (" + navidromeUrl + ")" : "no"));
-        if (activePlayer && currentTitle)
-            fetchDebounceTimer.restart();
+        if (activePlayer && currentTitle) fetchDebounceTimer.restart();
     }
 
-    // Debounce timer — avoids double-fetch when title and artist change simultaneously
     Timer {
         id: fetchDebounceTimer
         interval: 300
@@ -117,7 +108,6 @@ PluginComponent {
     onCurrentTitleChanged: fetchDebounceTimer.restart()
     onCurrentArtistChanged: fetchDebounceTimer.restart()
 
-    // Force-update toggle to poll MPRIS position
     property bool _forceUpdate: false
 
     // -------------------------------------------------------------------------
@@ -127,6 +117,8 @@ PluginComponent {
     function _resetLyricsState() {
         lyricsLines = [];
         currentLineIndex = -1;
+        _fallbackLines = [];
+        _fallbackSource = lyricSrc.none;
         navidromeStatus = status.none;
         lrclibStatus = status.none;
         lrcapiStatus = status.none;
@@ -136,16 +128,27 @@ PluginComponent {
         lyricSource = lyricSrc.none;
     }
 
-    // Sets the "no synced lyrics" state, used by musixmatch handlers
     function _setMusixmatchNotFound(musixmatchStatusVal) {
         musixmatchStatus = musixmatchStatusVal;
         _fetchFromLrcApi(_lastFetchedTrack, _lastFetchedArtist);
     }
 
-    // Sets the final "no synced lyrics" state after all sources exhausted
     function _setFinalNotFound(lrclibStatusVal) {
-        lrclibStatus = lrclibStatusVal;
-        lyricStatus = lyricState.notFound;
+        if (root._fallbackLines.length > 0) {
+            root.lyricsLines = root._fallbackLines;
+            root.lyricStatus = lyricState.synced;
+            root.lyricSource = root._fallbackSource;
+            if (root._fallbackSource === lyricSrc.navidrome) {
+                root.navidromeStatus = status.found; 
+                root.lrclibStatus = lrclibStatusVal;
+            } else if (root._fallbackSource === lyricSrc.lrclib) {
+                root.lrclibStatus = status.found;
+            }
+            console.info("[MusicLyrics] Using unsynced fallback lyrics (" + root._fallbackLines.length + " lines)");
+        } else {
+            lrclibStatus = lrclibStatusVal;
+            lyricStatus = lyricState.notFound;
+        }
         root._cancelActiveFetch = null;
     }
 
@@ -171,25 +174,20 @@ PluginComponent {
         return _cacheDir + "/" + _cacheKey(title, artist) + ".json";
     }
 
-    // Static one-shot timer for XHR request timeouts
     Timer {
         id: xhrTimeoutTimer
         repeat: false
         property var onTimeout: null
-        onTriggered: if (onTimeout)
-            onTimeout()
+        onTriggered: if (onTimeout) onTimeout()
     }
 
-    // Static one-shot timer for retry delays
     Timer {
         id: xhrRetryTimer
         repeat: false
         property var onRetry: null
-        onTriggered: if (onRetry)
-            onRetry()
+        onTriggered: if (onRetry) onRetry()
     }
 
-    // Cache directory creation
     property bool _cacheDirReady: false
 
     Process {
@@ -199,13 +197,11 @@ PluginComponent {
     }
 
     function _ensureCacheDir() {
-        if (_cacheDirReady)
-            return;
+        if (_cacheDirReady) return;
         _cacheDirReady = true;
         mkdirProcess.running = true;
     }
 
-    // Cache read using FileView
     Component {
         id: cacheReaderComponent
         FileView {
@@ -213,11 +209,7 @@ PluginComponent {
             blockLoading: true
             preload: true
             onLoaded: {
-                try {
-                    callback(JSON.parse(text()));
-                } catch (e) {
-                    callback(null);
-                }
+                try { callback(JSON.parse(text())); } catch (e) { callback(null); }
                 destroy();
             }
             onLoadFailed: {
@@ -234,7 +226,6 @@ PluginComponent {
         });
     }
 
-    // Cache write using FileView
     Component {
         id: cacheWriterComponent
         FileView {
@@ -260,10 +251,7 @@ PluginComponent {
             cTitle: title,
             cArtist: artist
         });
-        writer.setText(JSON.stringify({
-            lines: lines,
-            source: source
-        }));
+        writer.setText(JSON.stringify({ lines: lines, source: source }));
     }
 
     // -------------------------------------------------------------------------
@@ -273,8 +261,7 @@ PluginComponent {
     function fetchLyricsIfNeeded() {
         var player = root.activePlayer;
         var whitelist = root.playerWhitelist.split(",").map(function(s) { return s.trim(); });
-        if (!player)
-            return;
+        if (!player) return;
         var identity = player.identity || "";
         var isMusicPlayer = false;
         for (var i = 0; i < whitelist.length; i++) {
@@ -283,19 +270,14 @@ PluginComponent {
                 break;
             }
         }
-        if (!isMusicPlayer)
-        {
+        if (!isMusicPlayer) {
             _resetLyricsState();
             return;
         }
 
-        if (!currentTitle)
-            return;
+        if (!currentTitle) return;
+        if (currentTitle === _lastFetchedTrack && currentArtist === _lastFetchedArtist) return;
 
-        if (currentTitle === _lastFetchedTrack && currentArtist === _lastFetchedArtist)
-            return;
-
-        // Cancel any in-flight XHR before starting fresh
         if (_cancelActiveFetch) {
             _cancelActiveFetch();
             _cancelActiveFetch = null;
@@ -316,16 +298,13 @@ PluginComponent {
                 _fetchFromNavidrome(capturedTitle, capturedArtist);
             } else {
                 navidromeStatus = status.skippedConfig;
-                console.info("[MusicLyrics] Navidrome: skipped (not configured)");
                 _fetchFromMusixmatch(capturedTitle, capturedArtist);
             }
         }
 
         if (cachingEnabled) {
             readFromCache(capturedTitle, capturedArtist, function (cached) {
-                // Guard: track may have changed while the file read was in progress
-                if (capturedTitle !== root._lastFetchedTrack || capturedArtist !== root._lastFetchedArtist)
-                    return;
+                if (capturedTitle !== root._lastFetchedTrack || capturedArtist !== root._lastFetchedArtist) return;
                 if (cached && cached.lines && cached.lines.length > 0) {
                     root.lyricsLines = cached.lines;
                     root.lyricStatus = lyricState.synced;
@@ -375,8 +354,7 @@ PluginComponent {
             xhrTimeoutTimer.start();
 
             currentXhr.onreadystatechange = function () {
-                if (currentXhr.readyState !== XMLHttpRequest.DONE || done || cancelled)
-                    return;
+                if (currentXhr.readyState !== XMLHttpRequest.DONE || done || cancelled) return;
                 done = true;
                 xhrTimeoutTimer.stop();
                 if (currentXhr.status === 0) {
@@ -392,8 +370,7 @@ PluginComponent {
             };
             currentXhr.open("GET", url);
             if (customHeaders) {
-                for (var key in customHeaders)
-                    currentXhr.setRequestHeader(key, customHeaders[key]);
+                for (var key in customHeaders) currentXhr.setRequestHeader(key, customHeaders[key]);
             } else {
                 currentXhr.setRequestHeader("User-Agent", "DankMaterialShell MusicLyrics/1.5.0 (https://github.com/Gasiyu/dms-plugin-musiclyrics)");
                 currentXhr.setRequestHeader("Accept", "application/json");
@@ -402,8 +379,7 @@ PluginComponent {
         }
 
         function _retry(errMsg) {
-            if (cancelled)
-                return;
+            if (cancelled) return;
             if (retriesLeft > 0) {
                 retriesLeft--;
                 console.warn("[MusicLyrics] _xhrGet: " + errMsg + " — retrying (attempt " + (attempt + 1) + ", " + retriesLeft + " left): " + url);
@@ -418,13 +394,11 @@ PluginComponent {
 
         _attempt();
 
-        // Return a cancel function the caller can invoke to abort the entire chain
         return function cancel() {
             cancelled = true;
             xhrTimeoutTimer.stop();
             xhrRetryTimer.stop();
-            if (currentXhr)
-                currentXhr.abort();
+            if (currentXhr) currentXhr.abort();
             console.info("[MusicLyrics] ⊘ XHR cancelled: " + url);
         };
     }
@@ -433,7 +407,6 @@ PluginComponent {
     // Navidrome fetch
     // -------------------------------------------------------------------------
 
-    // Builds a Navidrome REST URL with common auth params appended
     function _navidromeUrl(endpoint, extraParams) {
         var base = navidromeUrl.replace(/\/+$/, "") + "/rest/" + endpoint;
         var auth = "u=" + encodeURIComponent(navidromeUser) + "&p=" + encodeURIComponent(navidromePassword) + "&v=1.16.1&c=DankMaterialShell&f=json";
@@ -442,17 +415,11 @@ PluginComponent {
 
     function _fetchFromNavidrome(expectedTitle, expectedArtist) {
         navidromeStatus = status.searching;
-        console.info("[MusicLyrics] Navidrome: searching for \"" + expectedTitle + "\" by " + expectedArtist);
-
         var searchUrl = _navidromeUrl("search3", "query=" + encodeURIComponent(expectedTitle) + "&songCount=5&albumCount=0&artistCount=0");
-        console.log("[MusicLyrics] Navidrome: search URL = " + searchUrl);
-
         root._cancelActiveFetch = _xhrGet(searchUrl, 15000, function (responseText, httpStatus) {
             var rawData = (responseText || "").trim();
-            console.log("[MusicLyrics] Navidrome: search response length = " + rawData.length);
             if (rawData.length === 0) {
                 root.navidromeStatus = status.error;
-                console.warn("[MusicLyrics] Navidrome: empty search response (HTTP " + httpStatus + ")");
                 root._fetchFromMusixmatch(expectedTitle, expectedArtist);
                 return;
             }
@@ -461,12 +428,10 @@ PluginComponent {
                 var songs = result["subsonic-response"]?.searchResult3?.song;
                 if (!songs || songs.length === 0) {
                     root.navidromeStatus = status.notFound;
-                    console.info("[MusicLyrics] ✗ Navidrome: no matching songs found for \"" + expectedTitle + "\"");
                     root._fetchFromMusixmatch(expectedTitle, expectedArtist);
                     return;
                 }
 
-                // Prefer exact title match, fall back to first result
                 var songId = songs[0].id;
                 for (var i = 0; i < songs.length; i++) {
                     if (songs[i].title.toLowerCase() === expectedTitle.toLowerCase()) {
@@ -475,31 +440,23 @@ PluginComponent {
                     }
                 }
 
-                console.log("[MusicLyrics] Navidrome: song matched (id: " + songId + "), fetching lyrics…");
                 root._fetchNavidromeLyrics(songId, expectedTitle, expectedArtist);
             } catch (e) {
                 root.navidromeStatus = status.error;
-                console.warn("[MusicLyrics] Navidrome: failed to parse search response — " + e);
-                console.warn("[MusicLyrics] Navidrome: raw data: " + rawData.substring(0, 200));
                 root._fetchFromMusixmatch(expectedTitle, expectedArtist);
             }
         }, function (errMsg) {
             root.navidromeStatus = status.error;
-            console.warn("[MusicLyrics] Navidrome: search request failed — " + errMsg);
             root._fetchFromMusixmatch(expectedTitle, expectedArtist);
         });
     }
 
     function _fetchNavidromeLyrics(songId, expectedTitle, expectedArtist) {
         var lyricsUrl = _navidromeUrl("getLyricsBySongId", "id=" + encodeURIComponent(songId));
-        console.log("[MusicLyrics] Navidrome: lyrics URL = " + lyricsUrl);
-
         root._cancelActiveFetch = _xhrGet(lyricsUrl, 15000, function (responseText, httpStatus) {
             var rawData = (responseText || "").trim();
-            console.log("[MusicLyrics] Navidrome: lyrics response length = " + rawData.length);
             if (rawData.length === 0) {
                 root.navidromeStatus = status.error;
-                console.warn("[MusicLyrics] Navidrome: empty lyrics response (HTTP " + httpStatus + ")");
                 root._fetchFromMusixmatch(expectedTitle, expectedArtist);
                 return;
             }
@@ -508,7 +465,6 @@ PluginComponent {
                 var lyricsList = result["subsonic-response"]?.lyricsList?.structuredLyrics;
                 if (!lyricsList || lyricsList.length === 0) {
                     root.navidromeStatus = status.notFound;
-                    console.info("[MusicLyrics] ✗ Navidrome: no lyrics available for \"" + expectedTitle + "\"");
                     root._fetchFromMusixmatch(expectedTitle, expectedArtist);
                     return;
                 }
@@ -526,10 +482,7 @@ PluginComponent {
 
                 if (synced && synced.line) {
                     var lines = synced.line.map(function (l) {
-                        return {
-                            time: (l.start || 0) / 1000,
-                            text: l.value || ""
-                        };
+                        return { time: (l.start || 0) / 1000, text: l.value || "" };
                     });
                     root.lyricsLines = lines;
                     root.navidromeStatus = status.found;
@@ -538,28 +491,25 @@ PluginComponent {
                     root.lrclibStatus = status.skippedFound;
                     root.lrcapiStatus = status.skippedFound;
                     root.musixmatchStatus = status.skippedFound;
-                    console.info("[MusicLyrics] ✓ Navidrome: synced lyrics found (" + lines.length + " lines) for \"" + expectedTitle + "\"");
                     root._cancelActiveFetch = null;
-                    if (root.cachingEnabled)
-                        root.writeToCache(expectedTitle, expectedArtist, lines, lyricSrc.navidrome);
+                    if (root.cachingEnabled) root.writeToCache(expectedTitle, expectedArtist, lines, lyricSrc.navidrome);
                 } else if (unsynced && unsynced.line) {
+                    root._fallbackLines = unsynced.line.map(function (l) {
+                        return { time: -1, text: l.value || "" };
+                    });
+                    root._fallbackSource = lyricSrc.navidrome;
                     root.navidromeStatus = status.skippedPlain;
-                    console.info("[MusicLyrics] ✗ Navidrome: only plain lyrics found for \"" + expectedTitle + "\" (skipping, synced only)");
                     root._fetchFromMusixmatch(expectedTitle, expectedArtist);
                 } else {
                     root.navidromeStatus = status.notFound;
-                    console.info("[MusicLyrics] ✗ Navidrome: lyrics structure empty for \"" + expectedTitle + "\"");
                     root._fetchFromMusixmatch(expectedTitle, expectedArtist);
                 }
             } catch (e) {
                 root.navidromeStatus = status.error;
-                console.warn("[MusicLyrics] Navidrome: failed to parse lyrics response — " + e);
-                console.warn("[MusicLyrics] Navidrome: raw data: " + rawData.substring(0, 200));
                 root._fetchFromMusixmatch(expectedTitle, expectedArtist);
             }
         }, function (errMsg) {
             root.navidromeStatus = status.error;
-            console.warn("[MusicLyrics] Navidrome: lyrics request failed — " + errMsg);
             root._fetchFromMusixmatch(expectedTitle, expectedArtist);
         });
     }
@@ -571,56 +521,43 @@ PluginComponent {
     function _fetchFromLrclib(expectedTitle, expectedArtist) {
         if (lyricStatus === lyricState.synced) {
             lrclibStatus = status.skippedFound;
-            console.info("[MusicLyrics] lrclib: skipped (synced lyrics already found)");
             return;
         }
 
         lrclibStatus = status.searching;
-        console.info("[MusicLyrics] lrclib: searching for \"" + expectedTitle + "\" by " + expectedArtist);
-
         var url = "https://lrclib.net/api/get?artist_name=" + encodeURIComponent(expectedArtist) + "&track_name=" + encodeURIComponent(expectedTitle);
-        if (currentAlbum)
-            url += "&album_name=" + encodeURIComponent(currentAlbum);
-        if (currentDuration > 0)
-            url += "&duration=" + Math.round(currentDuration);
+        if (currentAlbum) url += "&album_name=" + encodeURIComponent(currentAlbum);
+        if (currentDuration > 0) url += "&duration=" + Math.round(currentDuration);
 
         root._cancelActiveFetch = _xhrGet(url, 20000, function (responseText, httpStatus) {
             var rawData = (responseText || "").trim();
-            console.log("[MusicLyrics] lrclib: response length = " + rawData.length);
             if (rawData.length === 0) {
                 root._setFinalNotFound(status.error);
-                console.warn("[MusicLyrics] lrclib: empty response (HTTP " + httpStatus + ")");
                 return;
             }
             try {
                 var result = JSON.parse(rawData);
                 if (result.statusCode === 404 || result.error) {
                     root._setFinalNotFound(status.notFound);
-                    console.info("[MusicLyrics] ✗ lrclib: no lyrics found for \"" + expectedTitle + "\"");
                 } else if (result.syncedLyrics) {
                     root.lyricsLines = root.parseLrc(result.syncedLyrics);
                     root.lrclibStatus = status.found;
                     root.lyricStatus = lyricState.synced;
                     root.lyricSource = lyricSrc.lrclib;
-                    console.info("[MusicLyrics] ✓ lrclib: synced lyrics found (" + root.lyricsLines.length + " lines) for \"" + expectedTitle + "\"");
                     root._cancelActiveFetch = null;
-                    if (root.cachingEnabled)
-                        root.writeToCache(expectedTitle, expectedArtist, root.lyricsLines, lyricSrc.lrclib);
+                    if (root.cachingEnabled) root.writeToCache(expectedTitle, expectedArtist, root.lyricsLines, lyricSrc.lrclib);
                 } else if (result.plainLyrics) {
+                    root._fallbackLines = result.plainLyrics.split("\n").map(function(l) { return { time: -1, text: l.trim() }; }).filter(function(l) { return l.text.length > 0; });
+                    root._fallbackSource = lyricSrc.lrclib;
                     root._setFinalNotFound(status.skippedPlain);
-                    console.info("[MusicLyrics] ✗ lrclib: only plain lyrics found for \"" + expectedTitle + "\" (skipping, synced only)");
                 } else {
                     root._setFinalNotFound(status.notFound);
-                    console.info("[MusicLyrics] ✗ lrclib: response contained no lyrics for \"" + expectedTitle + "\"");
                 }
             } catch (e) {
                 root._setFinalNotFound(status.error);
-                console.warn("[MusicLyrics] lrclib: failed to parse response — " + e);
-                console.warn("[MusicLyrics] lrclib: raw data: " + rawData.substring(0, 200));
             }
         }, function (errMsg) {
             root._setFinalNotFound(status.error);
-            console.warn("[MusicLyrics] lrclib: request failed — " + errMsg);
         });
     }
 
@@ -631,23 +568,17 @@ PluginComponent {
     function _fetchFromLrcApi(expectedTitle, expectedArtist) {
         if (lyricStatus === lyricState.synced) {
             lrcapiStatus = status.skippedFound;
-            console.info("[MusicLyrics] lrcapi: skipped (synced lyrics already found)");
             return;
         }
 
         lrcapiStatus = status.searching;
-        console.info("[MusicLyrics] lrcapi: searching for \"" + expectedTitle + "\" by " + expectedArtist);
-
         var url = "https://api.lrc.cx/lyrics?artist=" + encodeURIComponent(expectedArtist) + "&title=" + encodeURIComponent(expectedTitle);
-        if (currentAlbum)
-            url += "&album=" + encodeURIComponent(currentAlbum);
+        if (currentAlbum) url += "&album=" + encodeURIComponent(currentAlbum);
 
         root._cancelActiveFetch = _xhrGet(url, 20000, function (responseText, httpStatus) {
             var rawData = (responseText || "").trim();
-            console.log("[MusicLyrics] lrcapi: response length = " + rawData.length);
             if (rawData.length === 0) {
                 lrcapiStatus = status.error;
-                console.warn("[MusicLyrics] lrcapi: empty response (HTTP " + httpStatus + ")");
                 return;
             }
             try {
@@ -657,22 +588,17 @@ PluginComponent {
                     root.lyricStatus = lyricState.synced;
                     root.lrcapiStatus = status.found;
                     root.lyricSource = lyricSrc.lrcapi;
-                    console.info("[MusicLyrics] ✓ lrcapi: synced lyrics found (" + root.lyricsLines.length + " lines) for \"" + expectedTitle + "\"");
                     root._cancelActiveFetch = null;
-                    if (root.cachingEnabled)
-                        root.writeToCache(expectedTitle, expectedArtist, root.lyricsLines, lyricSrc.lrcapi);
+                    if (root.cachingEnabled) root.writeToCache(expectedTitle, expectedArtist, root.lyricsLines, lyricSrc.lrcapi);
                 } else {
                     lrcapiStatus = status.notFound;
                 }
                 _fetchFromLrclib(_lastFetchedTrack, _lastFetchedArtist);
             } catch (e) {
                 root._setFinalNotFound(status.error);
-                console.warn("[MusicLyrics] lrcapi: failed to parse response — " + e);
-                console.warn("[MusicLyrics] lrcapi: raw data: " + rawData.substring(0, 200));
             }
         }, function (errMsg) {
             root._setFinalNotFound(status.error);
-            console.warn("[MusicLyrics] lrcapi: request failed — " + errMsg);
         });
     }
 
@@ -699,9 +625,6 @@ PluginComponent {
         }
 
         var url = "https://apic-desktop.musixmatch.com/ws/1.1/token.get" + "?user_language=en" + "&app_id=web-desktop-app-v1.0" + "&t=" + Date.now();
-
-        console.info("[MusicLyrics] Musixmatch: fetching token…");
-
         root._cancelActiveFetch = _xhrGet(url, 15000, function (responseText, httpStatus) {
             try {
                 var result = JSON.parse(responseText);
@@ -710,18 +633,14 @@ PluginComponent {
                 if (token && token !== "undefined" && token !== "") {
                     root._musixmatchToken = token;
                     pluginService.savePluginData("musicLyrics", "musixmatchToken", token);
-                    console.info("[MusicLyrics] Musixmatch: token acquired");
                     callback(token);
                 } else {
-                    console.warn("[MusicLyrics] Musixmatch: empty token in response");
                     callback(null);
                 }
             } catch (e) {
-                console.warn("[MusicLyrics] Musixmatch: failed to parse token response — " + e);
                 callback(null);
             }
         }, function (errMsg) {
-            console.warn("[MusicLyrics] Musixmatch: token request failed — " + errMsg);
             callback(null);
         }, _musixmatchHeaders());
     }
@@ -729,23 +648,17 @@ PluginComponent {
     function _fetchFromMusixmatch(expectedTitle, expectedArtist, _tokenRetried) {
         if (lyricStatus === lyricState.synced) {
             musixmatchStatus = status.skippedFound;
-            console.info("[MusicLyrics] Musixmatch: skipped (synced lyrics already found)");
             return;
         }
 
         musixmatchStatus = status.searching;
-        console.info("[MusicLyrics] Musixmatch: searching for \"" + expectedTitle + "\" by " + expectedArtist);
-
         _fetchMusixmatchToken(function (token) {
             if (!token) {
                 root._setMusixmatchNotFound(status.error);
-                console.warn("[MusicLyrics] Musixmatch: no token available, cannot search");
                 return;
             }
 
-            // Guard: track may have changed
-            if (expectedTitle !== root._lastFetchedTrack || expectedArtist !== root._lastFetchedArtist)
-                return;
+            if (expectedTitle !== root._lastFetchedTrack || expectedArtist !== root._lastFetchedArtist) return;
 
             var trackUrl = "https://apic-desktop.musixmatch.com/ws/1.1/matcher.track.get" + "?q_track=" + encodeURIComponent(expectedTitle) + "&q_artist=" + encodeURIComponent(expectedArtist) + "&page_size=1&page=1" + "&app_id=web-desktop-app-v1.0" + "&usertoken=" + encodeURIComponent(token) + "&t=" + Date.now();
 
@@ -754,14 +667,11 @@ PluginComponent {
                     var result = JSON.parse(responseText);
                     var headerStatusCode = result.message && result.message.header ? result.message.header.status_code : 0;
                     if (headerStatusCode === 401 || headerStatusCode === 402) {
-                        console.warn("[MusicLyrics] Musixmatch: auth error (status_code=" + headerStatusCode + ") in matcher.track.get");
                         if (!_tokenRetried) {
                             root._musixmatchToken = "";
-                            console.info("[MusicLyrics] Musixmatch: token cleared, retrying with fresh token…");
                             root._fetchFromMusixmatch(expectedTitle, expectedArtist, true);
                         } else {
                             root._setMusixmatchNotFound(status.error);
-                            console.warn("[MusicLyrics] Musixmatch: auth error persists after token refresh");
                         }
                         return;
                     }
@@ -769,29 +679,21 @@ PluginComponent {
                     var trackId = track.track_id;
                     if (!trackId) {
                         root._setMusixmatchNotFound(status.notFound);
-                        console.info("[MusicLyrics] ✗ Musixmatch: no track found for \"" + expectedTitle + "\"");
                         return;
                     }
 
                     var hasSubtitles = track.has_subtitles === 1;
-                    var hasLyrics = track.has_lyrics === 1;
-                    console.info("[MusicLyrics] Musixmatch: track matched (id: " + trackId + ", has_subtitles: " + hasSubtitles + ", has_lyrics: " + hasLyrics + ")");
-
                     if (!hasSubtitles) {
-                        root._setMusixmatchNotFound(hasLyrics ? status.skippedPlain : status.notFound);
-                        console.info("[MusicLyrics] ✗ Musixmatch: track has no synced lyrics (has_subtitles=0) for \"" + expectedTitle + "\"");
+                        root._setMusixmatchNotFound(status.notFound);
                         return;
                     }
 
-                    console.info("[MusicLyrics] Musixmatch: fetching synced lyrics…");
                     root._fetchMusixmatchLyrics(trackId, token, expectedTitle, expectedArtist);
                 } catch (e) {
                     root._setMusixmatchNotFound(status.error);
-                    console.warn("[MusicLyrics] Musixmatch: failed to parse track response — " + e);
                 }
             }, function (errMsg) {
                 root._setMusixmatchNotFound(status.error);
-                console.warn("[MusicLyrics] Musixmatch: track request failed — " + errMsg);
             }, _musixmatchHeaders());
         });
     }
@@ -800,36 +702,29 @@ PluginComponent {
         var url = "https://apic-desktop.musixmatch.com/ws/1.1/track.subtitle.get" + "?track_id=" + trackId + "&subtitle_format=lrc" + "&app_id=web-desktop-app-v1.0" + "&usertoken=" + encodeURIComponent(token) + "&t=" + Date.now();
 
         root._cancelActiveFetch = _xhrGet(url, 15000, function (responseText, httpStatus) {
-            // Guard: track may have changed
-            if (expectedTitle !== root._lastFetchedTrack || expectedArtist !== root._lastFetchedArtist)
-                return;
+            if (expectedTitle !== root._lastFetchedTrack || expectedArtist !== root._lastFetchedArtist) return;
 
             try {
                 var result = JSON.parse(responseText);
                 var headerStatusCode = result.message && result.message.header ? result.message.header.status_code : 0;
                 if (headerStatusCode === 401 || headerStatusCode === 402) {
-                    console.warn("[MusicLyrics] Musixmatch: auth error (status_code=" + headerStatusCode + ") in track.subtitle.get");
                     if (!_tokenRetried) {
                         root._musixmatchToken = "";
-                        console.info("[MusicLyrics] Musixmatch: token cleared, retrying with fresh token…");
                         root._fetchFromMusixmatch(expectedTitle, expectedArtist, true);
                     } else {
                         root._setMusixmatchNotFound(status.error);
-                        console.warn("[MusicLyrics] Musixmatch: auth error persists after token refresh");
                     }
                     return;
                 }
                 var subtitleBody = result.message.body.subtitle.subtitle_body;
                 if (!subtitleBody || subtitleBody.trim() === "") {
                     root._setMusixmatchNotFound(status.notFound);
-                    console.info("[MusicLyrics] ✗ Musixmatch: no synced lyrics for \"" + expectedTitle + "\"");
                     return;
                 }
 
                 var lines = root.parseLrc(subtitleBody);
                 if (lines.length === 0) {
                     root._setMusixmatchNotFound(status.notFound);
-                    console.info("[MusicLyrics] ✗ Musixmatch: failed to parse LRC for \"" + expectedTitle + "\"");
                     return;
                 }
 
@@ -839,39 +734,34 @@ PluginComponent {
                 root.lrcapiStatus = status.skippedFound;
                 root.lyricStatus = lyricState.synced;
                 root.lyricSource = lyricSrc.musixmatch;
-                console.info("[MusicLyrics] ✓ Musixmatch: synced lyrics found (" + lines.length + " lines) for \"" + expectedTitle + "\"");
                 root._cancelActiveFetch = null;
-                if (root.cachingEnabled)
-                    root.writeToCache(expectedTitle, expectedArtist, lines, lyricSrc.musixmatch);
+                if (root.cachingEnabled) root.writeToCache(expectedTitle, expectedArtist, lines, lyricSrc.musixmatch);
             } catch (e) {
                 root._setMusixmatchNotFound(status.error);
-                console.warn("[MusicLyrics] Musixmatch: failed to parse lyrics response — " + e);
             }
         }, function (errMsg) {
             root._setMusixmatchNotFound(status.error);
-            console.warn("[MusicLyrics] Musixmatch: lyrics request failed — " + errMsg);
         }, _musixmatchHeaders());
     }
 
     // -------------------------------------------------------------------------
-    // LRC parser
+    // LRC parser (with word-sync tag stripping)
     // -------------------------------------------------------------------------
 
     function parseLrc(lrcText) {
         var timeRegex = /\[(\d{2}):(\d{2})\.(\d{2,3})\]/;
+        var wordTimeRegex = /<\d{2}:\d{2}\.\d{2,3}>/g;
+        
         var result = lrcText.split("\n").reduce(function (acc, rawLine) {
             var line = rawLine.trim();
-            if (!line)
-                return acc;
+            if (!line) return acc;
             var match = timeRegex.exec(line);
-            if (!match)
-                return acc;
+            if (!match) return acc;
             var millis = parseInt(match[3]);
-            if (match[3].length === 2)
-                millis *= 10;
+            if (match[3].length === 2) millis *= 10;
             acc.push({
                 time: parseInt(match[1]) * 60 + parseInt(match[2]) + millis / 1000,
-                text: line.replace(/\[\d{2}:\d{2}\.\d{2,3}\]/g, "").trim()
+                text: line.replace(/\[\d{2}:\d{2}\.\d{2,3}\]/g, "").replace(wordTimeRegex, "").trim()
             });
             return acc;
         }, []);
@@ -882,25 +772,37 @@ PluginComponent {
     }
 
     // -------------------------------------------------------------------------
-    // Position tracking for synced lyrics
+    // Position tracking for synced/unsynced lyrics
     // -------------------------------------------------------------------------
 
     Timer {
         id: positionTimer
-        interval: 200
+        interval: 50 
         running: activePlayer && lyricsLines.length > 0
         repeat: true
+        
         onTriggered: {
+            if (!activePlayer) return;
             var pos = activePlayer.position || 0;
             var newIndex = -1;
-            for (var i = lyricsLines.length - 1; i >= 0; i--) {
-                if (pos >= lyricsLines[i].time) {
-                    newIndex = i;
-                    break;
+            
+            if (lyricsLines.length > 0 && (lyricsLines[0].time === undefined || lyricsLines[0].time < 0)) {
+                var lineDur = currentDuration > 0 ? currentDuration / lyricsLines.length : 4;
+                newIndex = Math.floor(pos / lineDur);
+                if (newIndex >= lyricsLines.length) newIndex = lyricsLines.length - 1;
+                if (newIndex < 0) newIndex = 0;
+            } else {
+                for (var i = lyricsLines.length - 1; i >= 0; i--) {
+                    if (pos >= lyricsLines[i].time) {
+                        newIndex = i;
+                        break;
+                    }
                 }
             }
-            if (newIndex !== currentLineIndex)
+            if (newIndex !== currentLineIndex) {
                 currentLineIndex = newIndex;
+            }
+            root._forceUpdate = !root._forceUpdate;
         }
     }
 
@@ -908,93 +810,43 @@ PluginComponent {
     // Status chip helpers
     // -------------------------------------------------------------------------
 
+    function isSourceActive(s) {
+        return s === status.found || s === status.cacheHit || s === status.skippedFound;
+    }
+
     readonly property var _chipMeta: ({
-            [status.searching]: {
-                color: Theme.secondary,
-                icon: "hourglass_top",
-                label: "Searching…"
-            },
-            [status.found]: {
-                color: Theme.primary,
-                icon: "check_circle",
-                label: "Found — Synced lyrics"
-            },
-            [status.notFound]: {
-                color: Theme.warning,
-                icon: "cancel",
-                label: "Not found"
-            },
-            [status.error]: {
-                color: Theme.error,
-                icon: "error",
-                label: "Error"
-            },
-            [status.skippedConfig]: {
-                color: Theme.warning,
-                icon: "block",
-                label: "Skipped — Not configured"
-            },
-            [status.skippedFound]: {
-                color: Theme.warning,
-                icon: "block",
-                label: "Skipped — Already found"
-            },
-            [status.skippedPlain]: {
-                color: Theme.warning,
-                icon: "block",
-                label: "Skipped — Plain lyrics only"
-            },
-            [status.cacheHit]: {
-                color: Theme.primary,
-                icon: "check_circle",
-                label: "Hit — Lyrics loaded from cache"
-            },
-            [status.cacheMiss]: {
-                color: Theme.warning,
-                icon: "cancel",
-                label: "Miss — Not in cache"
-            },
-            [status.cacheDisabled]: {
-                color: Theme.surfaceVariantText,
-                icon: "do_not_disturb_on",
-                label: "Disabled"
-            }
+            [status.searching]: { color: Theme.secondary, icon: "hourglass_top", label: "Searching…" },
+            [status.found]: { color: Theme.primary, icon: "check_circle", label: "Found" },
+            [status.notFound]: { color: Theme.warning, icon: "cancel", label: "Not found" },
+            [status.error]: { color: Theme.error, icon: "error", label: "Error" },
+            [status.skippedConfig]: { color: Theme.warning, icon: "block", label: "Skipped — Not configured" },
+            [status.skippedFound]: { color: Theme.warning, icon: "block", label: "Skipped — Already found" },
+            [status.skippedPlain]: { color: Theme.warning, icon: "block", label: "Skipped — Plain lyrics only" },
+            [status.cacheHit]: { color: Theme.primary, icon: "check_circle", label: "Hit — Loaded from cache" },
+            [status.cacheMiss]: { color: Theme.warning, icon: "cancel", label: "Miss — Not in cache" },
+            [status.cacheDisabled]: { color: Theme.surfaceVariantText, icon: "do_not_disturb_on", label: "Disabled" }
         })
 
     function _chip(val) {
-        return _chipMeta[val] ?? {
-            color: Theme.surfaceContainerHighest,
-            icon: "radio_button_unchecked",
-            label: "Idle"
-        };
-    }
-
-    function chipColor(val) {
-        return _chip(val).color;
-    }
-    function chipIcon(val) {
-        return _chip(val).icon;
-    }
-    function chipLabel(val) {
-        return _chip(val).label;
+        return _chipMeta[val] ?? { color: Theme.surfaceContainerHighest, icon: "radio_button_unchecked", label: "Idle" };
     }
 
     // -------------------------------------------------------------------------
-    // Bar Pills: show current lyric line
+    // Bar Pill
     // -------------------------------------------------------------------------
 
     horizontalBarPill: root.activePlayer ? hPillComponent : null
 
     Component {
         id: hPillComponent
-        Row {
+        RowLayout {
             spacing: Theme.spacingS
 
             Rectangle {
+                Layout.alignment: Qt.AlignVCenter
                 width: chipContent.implicitWidth + Theme.spacingS * 2
                 height: Theme.fontSizeSmall + Theme.spacingXS
                 radius: 12
-                anchors.verticalCenter: parent.verticalCenter
                 color: Theme.primary
 
                 Row {
@@ -1025,10 +877,10 @@ PluginComponent {
                 text: root.currentLyricText
                 font.pixelSize: Theme.fontSizeSmall
                 color: Theme.surfaceText
-                anchors.verticalCenter: parent.verticalCenter
+                Layout.alignment: Qt.AlignVCenter
+                Layout.maximumWidth: 400 // Sane fallback, allows parent layout to restrict it further if needed
                 maximumLineCount: 1
                 elide: Text.ElideRight
-                width: Math.min(implicitWidth, 300)
             }
         }
     }
@@ -1057,12 +909,11 @@ PluginComponent {
     }
 
     // -------------------------------------------------------------------------
-    // Popout: Now Playing + Lyrics Sources
+    // Popout: Now Playing + Lyrics Stream View
     // -------------------------------------------------------------------------
 
     function _formatDuration(seconds) {
-        if (seconds <= 0)
-            return "—";
+        if (seconds <= 0) return "—";
         var m = Math.floor(seconds / 60);
         var s = Math.floor(seconds % 60);
         return m + ":" + ("0" + s).slice(-2);
@@ -1083,6 +934,7 @@ PluginComponent {
 
                     // ── Now Playing Card ──
                     Rectangle {
+                        id: nowPlayingCard
                         width: parent.width
                         height: nowPlayingContent.implicitHeight + Theme.spacingM * 2
                         radius: Theme.cornerRadius
@@ -1098,12 +950,10 @@ PluginComponent {
                             }
                             spacing: Theme.spacingM
 
-                            // Track info column (takes remaining space)
                             Column {
                                 width: _coverArt.visible ? parent.width - _coverArt.width - parent.spacing : parent.width
                                 spacing: Theme.spacingS
 
-                                // Header row: icon + "Now Playing"
                                 Row {
                                     spacing: Theme.spacingS
                                     width: parent.width
@@ -1124,7 +974,6 @@ PluginComponent {
                                     }
                                 }
 
-                                // Song title
                                 StyledText {
                                     width: parent.width
                                     text: root.currentTitle || "—"
@@ -1137,7 +986,6 @@ PluginComponent {
                                     visible: root.activePlayer
                                 }
 
-                                // Artist & Album
                                 Column {
                                     width: parent.width
                                     spacing: 2
@@ -1145,12 +993,7 @@ PluginComponent {
 
                                     Row {
                                         spacing: Theme.spacingXS
-                                        DankIcon {
-                                            name: "person"
-                                            size: 14
-                                            color: Theme.surfaceVariantText
-                                            anchors.verticalCenter: parent.verticalCenter
-                                        }
+                                        DankIcon { name: "person"; size: 14; color: Theme.surfaceVariantText; anchors.verticalCenter: parent.verticalCenter }
                                         StyledText {
                                             text: root.currentArtist || "Unknown Artist"
                                             font.pixelSize: Theme.fontSizeMedium
@@ -1164,12 +1007,7 @@ PluginComponent {
                                     Row {
                                         spacing: Theme.spacingXS
                                         visible: root.currentAlbum !== ""
-                                        DankIcon {
-                                            name: "album"
-                                            size: 14
-                                            color: Theme.surfaceVariantText
-                                            anchors.verticalCenter: parent.verticalCenter
-                                        }
+                                        DankIcon { name: "album"; size: 14; color: Theme.surfaceVariantText; anchors.verticalCenter: parent.verticalCenter }
                                         StyledText {
                                             text: root.currentAlbum
                                             font.pixelSize: Theme.fontSizeSmall
@@ -1181,7 +1019,6 @@ PluginComponent {
                                     }
                                 }
 
-                                // Progress bar with timestamps
                                 Column {
                                     width: parent.width
                                     spacing: 4
@@ -1195,7 +1032,6 @@ PluginComponent {
                                         activePlayer: root.activePlayer
                                     }
 
-                                    // Poll MPRIS position to keep seekbar and time text updated
                                     Timer {
                                         interval: 50
                                         running: root.activePlayer !== null
@@ -1218,34 +1054,26 @@ PluginComponent {
                                         StyledText {
                                             id: _currentTime
                                             text: {
-                                                void root._forceUpdate; // depend on polling toggle
-                                                if (!activePlayer)
-                                                    return "0:00";
+                                                void root._forceUpdate;
+                                                if (!activePlayer) return "0:00";
                                                 const rawPos = Math.max(0, activePlayer.position || 0);
                                                 const pos = activePlayer.length ? rawPos % Math.max(1, activePlayer.length) : rawPos;
                                                 const minutes = Math.floor(pos / 60);
                                                 const seconds = Math.floor(pos % 60);
-                                                const timeStr = minutes + ":" + (seconds < 10 ? "0" : "") + seconds;
-                                                return timeStr;
+                                                return minutes + ":" + (seconds < 10 ? "0" : "") + seconds;
                                             }
                                             font.pixelSize: Theme.fontSizeSmall - 1
                                             color: Theme.surfaceVariantText
                                         }
 
-                                        Item {
-                                            width: parent.width - _currentTime.implicitWidth - _endTime.implicitWidth
-                                            height: 1
-                                        }
+                                        Item { width: parent.width - _currentTime.implicitWidth - _endTime.implicitWidth; height: 1 }
 
                                         StyledText {
                                             id: _endTime
                                             text: {
-                                                if (!activePlayer || !activePlayer.length)
-                                                    return "0:00";
+                                                if (!activePlayer || !activePlayer.length) return "0:00";
                                                 const dur = Math.max(0, activePlayer.length || 0);
-                                                const minutes = Math.floor(dur / 60);
-                                                const seconds = Math.floor(dur % 60);
-                                                return minutes + ":" + (seconds < 10 ? "0" : "") + seconds;
+                                                return Math.floor(dur / 60) + ":" + (Math.floor(dur % 60) < 10 ? "0" : "") + Math.floor(dur % 60);
                                             }
                                             font.pixelSize: Theme.fontSizeSmall - 1
                                             color: Theme.surfaceVariantText
@@ -1254,7 +1082,6 @@ PluginComponent {
                                 }
                             }
 
-                            // Album cover art
                             DankAlbumArt {
                                 id: _coverArt
                                 width: 80
@@ -1267,159 +1094,154 @@ PluginComponent {
                         }
                     }
 
-                    // ── Section label ──
-                    StyledText {
-                        text: "Lyrics Sources"
-                        font.pixelSize: Theme.fontSizeSmall
-                        font.weight: Font.DemiBold
-                        color: Theme.surfaceVariantText
-                        leftPadding: Theme.spacingXS
-                    }
-
-                    // ── Source Cards ──
-                    Column {
+                    // ── Lyrics Stream View ──
+                    ListView {
+                        id: lyricsView
                         width: parent.width
+                        height: 300 
+                        clip: true
+                        model: root.lyricsLines
                         spacing: Theme.spacingS
-
-                        SourceCard {
-                            width: parent.width
-                            icon: "cached"
-                            label: "Cache"
-                            sourceStatus: root.cacheStatus
+                        
+                        currentIndex: root.currentLineIndex
+                        
+                        preferredHighlightBegin: height * 0.4
+                        preferredHighlightEnd: height * 0.6
+                        highlightRangeMode: ListView.ApplyRange
+                        highlightMoveDuration: 400
+                        highlightResizeDuration: 400
+                        highlightFollowsCurrentItem: true
+                        
+                        Text {
+                            anchors.centerIn: parent
+                            visible: root.lyricsLines.length === 0
+                            text: root.lyricsLoading ? "Searching lyrics…" : "No lyrics found"
+                            color: Theme.surfaceVariantText
+                            font.pixelSize: Theme.fontSizeMedium
                         }
-
-                        SourceCard {
-                            width: parent.width
-                            icon: "cloud"
-                            label: "Navidrome"
-                            sourceStatus: root.navidromeStatus
-                        }
-
-                        SourceCard {
-                            width: parent.width
-                            icon: "music_note"
-                            label: "Musixmatch"
-                            sourceStatus: root.musixmatchStatus
-                        }
-
-                        SourceCard {
-                            width: parent.width
-                            icon: "Genres"
-                            label: "lrcapi"
-                            sourceStatus: root.lrcapiStatus
-                        }
-
-                        SourceCard {
-                            width: parent.width
-                            icon: "library_music"
-                            label: "lrclib"
-                            sourceStatus: root.lrclibStatus
+                        
+                        delegate: Item {
+                            id: lineDelegate
+                            width: ListView.view.width
+                            height: Math.max(lyricTextDim.implicitHeight, lyricTextBright.implicitHeight) + Theme.spacingS
+                            
+                            property bool isActive: ListView.isCurrentItem
+                            property bool isMusicSymbol: /^[\s♪♫♬♩♭♯*]+$/.test(modelData.text || "")
+                            
+                            property real progress: {
+                                void root._forceUpdate;
+                                if (!isActive) return 0;
+                                
+                                var currTime = root.activePlayer ? root.activePlayer.position : 0;
+                                if (modelData.time === undefined || modelData.time < 0 || isMusicSymbol) {
+                                    return 1.0; // Display whole sentence/symbol at once
+                                } else {
+                                    var nextTime = (index + 1 < root.lyricsLines.length) ? root.lyricsLines[index+1].time : currTime + 5;
+                                    var dur = nextTime - modelData.time;
+                                    return Math.max(0, Math.min(1, (currTime - modelData.time) / Math.max(0.1, dur)));
+                                }
+                            }
+                            
+                            // Dim background text layer
+                            StyledText {
+                                id: lyricTextDim
+                                width: parent.width
+                                text: modelData.text || " "
+                                font.pixelSize: Theme.fontSizeLarge
+                                font.weight: Font.Normal 
+                                color: Theme.surfaceText
+                                opacity: lineDelegate.isActive ? 0.4 : 0.35
+                                wrapMode: Text.WordWrap
+                                horizontalAlignment: Text.AlignHCenter
+                            }
+                            
+                            // Bright foreground text layer, wiped by OpacityMask
+                            StyledText {
+                                id: lyricTextBright
+                                width: parent.width
+                                text: modelData.text || " "
+                                font.pixelSize: Theme.fontSizeLarge
+                                font.weight: Font.Normal 
+                                color: Theme.surfaceText
+                                opacity: 1.0
+                                wrapMode: Text.WordWrap
+                                horizontalAlignment: Text.AlignHCenter
+                                visible: lineDelegate.isActive && lineDelegate.progress > 0.01
+                                
+                                layer.enabled: true
+                                layer.effect: OpacityMask {
+                                    // Creates a mask that matches the text wrapping perfectly
+                                    maskSource: Column {
+                                        width: lyricTextBright.width
+                                        height: lyricTextBright.height
+                                        
+                                        Repeater {
+                                            model: lyricTextBright.lineCount > 0 ? lyricTextBright.lineCount : 1
+                                            
+                                            Item {
+                                                id: lineMask
+                                                width: parent.width
+                                                height: lyricTextBright.lineCount > 0 ? (lyricTextBright.height / lyricTextBright.lineCount) : parent.height
+                                                
+                                                readonly property real lineFraction: lyricTextBright.lineCount > 0 ? (1.0 / lyricTextBright.lineCount) : 1.0
+                                                readonly property real localProgress: (lineDelegate.progress - index * lineFraction) / lineFraction
+                                                readonly property real p: Math.max(0.0, Math.min(1.0, localProgress))
+                                                
+                                                Rectangle {
+                                                    anchors.fill: parent
+                                                    color: lineMask.p >= 1.0 ? "#FF000000" : "#00000000"
+                                                }
+                                                
+                                                LinearGradient {
+                                                    anchors.fill: parent
+                                                    visible: lineMask.p > 0.0 && lineMask.p < 1.0
+                                                    start: Qt.point(0, 0)
+                                                    end: Qt.point(parent.width, 0)
+                                                    gradient: Gradient {
+                                                        GradientStop { position: 0.0; color: "#FF000000" }
+                                                        GradientStop { position: Math.max(0.0, lineMask.p - 0.05); color: "#FF000000" }
+                                                        GradientStop { position: Math.min(1.0, lineMask.p + 0.05); color: "#00000000" }
+                                                        GradientStop { position: 1.0; color: "#00000000" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
-                }
-            }
-        }
-    }
 
-    // -------------------------------------------------------------------------
-    // Reusable source status card
-    // -------------------------------------------------------------------------
-
-    component SourceCard: Rectangle {
-        id: sourceCard
-        property string icon: ""
-        property string label: ""
-        property int sourceStatus: 0
-
-        height: 44
-        radius: Theme.cornerRadius
-        color: sourceStatus === 0 ? Theme.withAlpha(Theme.surfaceContainerHighest, 0.3) : Theme.withAlpha(root.chipColor(sourceStatus), 0.06)
-        visible: true
-
-        Row {
-            anchors {
-                left: parent.left
-                right: parent.right
-                verticalCenter: parent.verticalCenter
-                leftMargin: Theme.spacingM
-                rightMargin: Theme.spacingM
-            }
-            spacing: Theme.spacingS
-
-            // Source icon
-            Rectangle {
-                width: 28
-                height: 28
-                radius: 14
-                color: sourceCard.sourceStatus === 0 ? Theme.withAlpha(Theme.surfaceContainerHighest, 0.5) : Theme.withAlpha(root.chipColor(sourceCard.sourceStatus), 0.15)
-                anchors.verticalCenter: parent.verticalCenter
-
-                DankIcon {
-                    anchors.centerIn: parent
-                    name: sourceCard.icon
-                    size: 14
-                    color: sourceCard.sourceStatus === 0 ? Theme.surfaceVariantText : root.chipColor(sourceCard.sourceStatus)
-                }
-            }
-
-            // Label
-            StyledText {
-                text: sourceCard.label
-                font.pixelSize: Theme.fontSizeMedium
-                font.weight: Font.DemiBold
-                color: Theme.surfaceText
-                anchors.verticalCenter: parent.verticalCenter
-                width: 90
-            }
-
-            // Status chip – fills remaining width
-            Item {
-                anchors.verticalCenter: parent.verticalCenter
-                width: parent.width - parent.spacing * 2 - 28 - 90
-                height: 22
-
-                Rectangle {
-                    visible: sourceCard.sourceStatus !== 0
-                    anchors.fill: parent
-                    radius: 11
-                    color: Theme.withAlpha(root.chipColor(sourceCard.sourceStatus), 0.15)
-
+                    // ── Bottom Source Indicators ──
                     Row {
-                        id: statusChipContent
-                        anchors.centerIn: parent
-                        spacing: 4
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        spacing: Theme.spacingM
 
-                        DankIcon {
-                            name: root.chipIcon(sourceCard.sourceStatus)
-                            size: 12
-                            color: root.chipColor(sourceCard.sourceStatus)
-                            anchors.verticalCenter: parent.verticalCenter
+                        Rectangle {
+                            width: 32; height: 32; radius: 16
+                            color: Theme.withAlpha(root.isSourceActive(root.cacheStatus) ? Theme.primary : Theme.surfaceContainerHighest, 0.2)
+                            DankIcon { anchors.centerIn: parent; name: "cached"; size: 16; color: root.isSourceActive(root.cacheStatus) ? Theme.primary : Theme.surfaceVariantText }
                         }
-
-                        StyledText {
-                            text: root.chipLabel(sourceCard.sourceStatus)
-                            font.pixelSize: Theme.fontSizeSmall - 1
-                            color: root.chipColor(sourceCard.sourceStatus)
-                            anchors.verticalCenter: parent.verticalCenter
-                            maximumLineCount: 1
-                            elide: Text.ElideRight
+                        Rectangle {
+                            width: 32; height: 32; radius: 16
+                            color: Theme.withAlpha(root.isSourceActive(root.navidromeStatus) ? Theme.primary : Theme.surfaceContainerHighest, 0.2)
+                            DankIcon { anchors.centerIn: parent; name: "cloud"; size: 16; color: root.isSourceActive(root.navidromeStatus) ? Theme.primary : Theme.surfaceVariantText }
                         }
-                    }
-                }
-
-                // Idle label when no status
-                Rectangle {
-                    visible: sourceCard.sourceStatus === 0
-                    anchors.fill: parent
-                    radius: 11
-                    color: Theme.withAlpha(Theme.surfaceContainerHighest, 0.3)
-
-                    StyledText {
-                        anchors.centerIn: parent
-                        text: "Idle"
-                        font.pixelSize: Theme.fontSizeSmall
-                        color: Theme.surfaceVariantText
-                        maximumLineCount: 1
+                        Rectangle {
+                            width: 32; height: 32; radius: 16
+                            color: Theme.withAlpha(root.isSourceActive(root.musixmatchStatus) ? Theme.primary : Theme.surfaceContainerHighest, 0.2)
+                            DankIcon { anchors.centerIn: parent; name: "music_note"; size: 16; color: root.isSourceActive(root.musixmatchStatus) ? Theme.primary : Theme.surfaceVariantText }
+                        }
+                        Rectangle {
+                            width: 32; height: 32; radius: 16
+                            color: Theme.withAlpha(root.isSourceActive(root.lrcapiStatus) ? Theme.primary : Theme.surfaceContainerHighest, 0.2)
+                            DankIcon { anchors.centerIn: parent; name: "genres"; size: 16; color: root.isSourceActive(root.lrcapiStatus) ? Theme.primary : Theme.surfaceVariantText }
+                        }
+                        Rectangle {
+                            width: 32; height: 32; radius: 16
+                            color: Theme.withAlpha(root.isSourceActive(root.lrclibStatus) ? Theme.primary : Theme.surfaceContainerHighest, 0.2)
+                            DankIcon { anchors.centerIn: parent; name: "library_music"; size: 16; color: root.isSourceActive(root.lrclibStatus) ? Theme.primary : Theme.surfaceVariantText }
+                        }
                     }
                 }
             }
